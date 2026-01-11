@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysnow"
+version = "0.1.0"
+description = "A modular Python snow model with switchable parameterizations"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Reed Maxwell", email = "reedmm@princeton.edu"}
+]
+keywords = ["snow", "hydrology", "land surface model", "CLM", "snowpack"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "matplotlib>=3.0",
+]
+plotting = [
+    "matplotlib>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/reedmaxwell/pysnow"
+Documentation = "https://github.com/reedmaxwell/pysnow#readme"
+Repository = "https://github.com/reedmaxwell/pysnow.git"
+Issues = "https://github.com/reedmaxwell/pysnow/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pysnow*"]
+
+[tool.setuptools.package-data]
+pysnow = ["py.typed"]
