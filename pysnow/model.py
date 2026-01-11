@@ -35,6 +35,8 @@ class SnowConfig:
     # Phase change
     phase_change_method: str = 'hierarchy'
     cold_content_tax: bool = False
+    thin_snow_damping: float = 0.0  # Fraction of energy absorbed for thin snow [0-1]
+    thin_snow_threshold: float = 50.0  # SWE threshold for thin snow damping [mm]
 
     # Compaction
     compaction_method: str = 'essery'
@@ -273,7 +275,9 @@ class PySnowModel:
             phase_result = thermal.apply_energy_to_snowpack(
                 energy, state.swe, state.t_snow, state.liquid_water,
                 method=cfg.phase_change_method,
-                cold_content_tax=cfg.cold_content_tax
+                cold_content_tax=cfg.cold_content_tax,
+                thin_snow_damping=cfg.thin_snow_damping,
+                thin_snow_threshold=cfg.thin_snow_threshold
             )
 
             state.swe = phase_result['swe']

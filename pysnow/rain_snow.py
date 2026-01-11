@@ -5,7 +5,16 @@ Available methods:
 - 'threshold': Simple temperature threshold (CLM-style)
 - 'linear': Linear ramp between thresholds (CLM Round 2)
 - 'jennings': Humidity-dependent logistic (Jennings et al. 2018)
-- 'wet_bulb': Wet-bulb temperature threshold (CoLM option)
+- 'dai': Hyperbolic tangent (Dai 2008) - global precipitation study
+- 'wetbulb': Wet-bulb temperature threshold (Wang et al. 2019) - recommended for dry mountains
+- 'wetbulb_linear': Wet-bulb with linear transition zone
+- 'wetbulb_sigmoid': Wet-bulb sigmoid (Wang et al. 2019) - continuous probability
+
+References:
+- Dai (2008) J. Climate, doi:10.1175/2008JCLI2299.1 - Global precipitation analysis
+- Jennings et al. (2018) Nature Communications, doi:10.1038/s41467-018-03629-7
+- Wang et al. (2019) GRL, doi:10.1029/2019GL085722 - Wet-bulb method
+- Stull (2011) J. Appl. Meteor. Climatol. - Wet-bulb temperature formula
 """
 
 import numpy as np
@@ -45,10 +54,20 @@ def partition_rain_snow(precip, t_air, rh=None, pressure=None, method='linear', 
         if rh is None:
             raise ValueError("RH required for Jennings method")
         return _jennings(t_air, rh, **kwargs)
-    elif method == 'wet_bulb':
+    elif method == 'dai':
+        return _dai(t_air, **kwargs)
+    elif method in ('wet_bulb', 'wetbulb'):
         if rh is None or pressure is None:
-            raise ValueError("RH and pressure required for wet_bulb method")
-        return _wet_bulb(t_air, rh, pressure, **kwargs)
+            raise ValueError("RH and pressure required for wetbulb method")
+        return _wetbulb(t_air, rh, pressure, **kwargs)
+    elif method == 'wetbulb_linear':
+        if rh is None or pressure is None:
+            raise ValueError("RH and pressure required for wetbulb_linear method")
+        return _wetbulb_linear(t_air, rh, pressure, **kwargs)
+    elif method == 'wetbulb_sigmoid':
+        if rh is None or pressure is None:
+            raise ValueError("RH and pressure required for wetbulb_sigmoid method")
+        return _wetbulb_sigmoid(t_air, rh, pressure, **kwargs)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -129,9 +148,54 @@ def _jennings_continuous(t_air, rh, a=-10.04, b=1.41, g=0.09, **kwargs):
     return 1.0 / (1.0 + np.exp(a + b * t_celsius + g * rh_pct))
 
 
-def _wet_bulb(t_air, rh, pressure, t_threshold=TFRZ, **kwargs):
+def _dai(t_air, a=48.2292, b=0.7205, c=1.1662, **kwargs):
     """
-    Wet-bulb temperature threshold (CoLM option).
+    Dai (2008) hyperbolic tangent rain-snow partitioning.
+
+    Uses a smooth hyperbolic tangent transition based on global precipitation
+    analysis. The 50% rain/snow threshold is approximately 1.17°C.
+
+    Parameters
+    ----------
+    t_air : float
+        Air temperature [K]
+    a : float
+        Amplitude coefficient (controls steepness), default 48.2292
+    b : float
+        Slope coefficient [K^-1], default 0.7205
+    c : float
+        Temperature offset (50% threshold) [°C], default 1.1662
+
+    Returns
+    -------
+    float
+        Snow fraction [0-1]
+
+    Reference
+    ---------
+    Dai (2008) J. Climate, doi:10.1175/2008JCLI2299.1
+    """
+    t_celsius = t_air - TFRZ
+
+    # Hyperbolic tangent form: snow fraction decreases as T increases
+    # f_s = 0.5 * (1 - tanh(b*(T-c))) gives proper asymptotic behavior
+    # Scaled version to match Dai's coefficients
+    snow_frac = 0.5 - (a * np.tanh(b * (t_celsius - c))) / 100.0
+
+    return np.clip(snow_frac, 0.0, 1.0)
+
+
+def _wetbulb(t_air, rh, pressure, tw_threshold=None, **kwargs):
+    """
+    Wet-bulb temperature threshold (Wang et al. 2019).
+
+    Uses wet-bulb temperature instead of air temperature for rain-snow
+    partitioning. This is more accurate in dry environments because
+    falling hydrometeors cool via evaporation, so their surface temperature
+    is closer to Tw than Ta.
+
+    In dry air (low RH), Tw is significantly depressed below Ta, meaning
+    snow can persist even when Ta > 0°C.
 
     Parameters
     ----------
@@ -141,11 +205,111 @@ def _wet_bulb(t_air, rh, pressure, t_threshold=TFRZ, **kwargs):
         Relative humidity [0-1]
     pressure : float
         Air pressure [Pa]
-    t_threshold : float
-        Wet-bulb threshold for snow [K]
+    tw_threshold : float, optional
+        Wet-bulb threshold for snow [K]. Default is TFRZ + 1.0 (1°C)
+        per Wang et al. (2019) recommendation.
+
+    Returns
+    -------
+    float
+        Snow fraction (0 or 1)
+
+    Reference
+    ---------
+    Wang et al. (2019) GRL, doi:10.1029/2019GL085722
+    """
+    if tw_threshold is None:
+        tw_threshold = TFRZ + 1.0  # Wang et al. recommend ~1°C
+
+    t_wb = _calc_wet_bulb(t_air, rh, pressure)
+    return 1.0 if t_wb <= tw_threshold else 0.0
+
+
+def _wetbulb_linear(t_air, rh, pressure, tw_all_snow=None, tw_all_rain=None, **kwargs):
+    """
+    Wet-bulb temperature with linear transition zone.
+
+    Combines wet-bulb approach with smooth transition rather than
+    binary threshold. May be more physically realistic for mixed-phase
+    precipitation events.
+
+    Parameters
+    ----------
+    t_air : float
+        Air temperature [K]
+    rh : float
+        Relative humidity [0-1]
+    pressure : float
+        Air pressure [Pa]
+    tw_all_snow : float, optional
+        Wet-bulb temp below which all precip is snow [K]. Default TFRZ (0°C)
+    tw_all_rain : float, optional
+        Wet-bulb temp above which all precip is rain [K]. Default TFRZ + 2 (2°C)
+
+    Returns
+    -------
+    float
+        Snow fraction [0-1]
+    """
+    if tw_all_snow is None:
+        tw_all_snow = TFRZ
+    if tw_all_rain is None:
+        tw_all_rain = TFRZ + 2.0
+
+    t_wb = _calc_wet_bulb(t_air, rh, pressure)
+
+    if t_wb <= tw_all_snow:
+        return 1.0
+    elif t_wb >= tw_all_rain:
+        return 0.0
+    else:
+        return (tw_all_rain - t_wb) / (tw_all_rain - tw_all_snow)
+
+
+def _wetbulb_sigmoid(t_air, rh, pressure, a=6.99e-5, b=2.0, c=3.97, **kwargs):
+    """
+    Wang et al. (2019) wet-bulb sigmoid rain-snow partitioning.
+
+    Uses a smooth sigmoid transition based on wet-bulb temperature.
+    More physically realistic than a binary threshold, providing
+    continuous probability of snow vs rain.
+
+    The 50% threshold occurs at approximately Tw = -0.8°C.
+
+    Parameters
+    ----------
+    t_air : float
+        Air temperature [K]
+    rh : float
+        Relative humidity [0-1]
+    pressure : float
+        Air pressure [Pa]
+    a : float
+        Sigmoid coefficient, default 6.99e-5
+    b : float
+        Sigmoid exponent coefficient [K^-1], default 2.0
+    c : float
+        Temperature offset [K], default 3.97
+
+    Returns
+    -------
+    float
+        Snow fraction [0-1]
+
+    Reference
+    ---------
+    Wang et al. (2019) GRL, doi:10.1029/2019GL085722
     """
     t_wb = _calc_wet_bulb(t_air, rh, pressure)
-    return 1.0 if t_wb <= t_threshold else 0.0
+    t_wb_celsius = t_wb - TFRZ
+
+    # Sigmoid formula: f_s = 1 / (1 + a * exp(b * (T_w + c)))
+    # At low Tw: exp term → 0, f_s → 1 (all snow)
+    # At high Tw: exp term → large, f_s → 0 (all rain)
+    exp_term = a * np.exp(b * (t_wb_celsius + c))
+    snow_frac = 1.0 / (1.0 + exp_term)
+
+    return np.clip(snow_frac, 0.0, 1.0)
 
 
 def _calc_wet_bulb(t_air, rh, pressure):

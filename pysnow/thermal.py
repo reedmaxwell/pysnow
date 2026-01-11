@@ -209,7 +209,8 @@ def apply_energy_to_snowpack(energy, swe, t_snow, liquid_water,
 
 
 def _energy_hierarchy(energy, swe, t_snow, liquid_water,
-                      cold_content_tax=False, min_swe_thermal=5.0, **kwargs):
+                      cold_content_tax=False, min_swe_thermal=5.0,
+                      thin_snow_damping=0.0, thin_snow_threshold=50.0, **kwargs):
     """
     SNOWCLIM-style energy hierarchy:
     1. Cold content warming
@@ -231,10 +232,22 @@ def _energy_hierarchy(energy, swe, t_snow, liquid_water,
     min_swe_thermal : float
         Minimum effective SWE for thermal calculations [mm]
         Prevents numerical instability with thin snow
+    thin_snow_damping : float
+        Fraction of positive energy to absorb for thin snow [0-1]
+        Represents thermal buffering from underlying soil
+    thin_snow_threshold : float
+        SWE threshold below which thin snow damping applies [mm]
     """
     melt = 0.0
     refreeze = 0.0
     ice = swe - liquid_water  # Ice portion
+
+    # Thin snow damping: reduce positive energy for shallow snowpacks
+    # This represents thermal buffering from underlying soil and microsite effects
+    # that protect thin snow from rapid warming during brief warm spells
+    if thin_snow_damping > 0 and energy > 0 and swe > 0 and swe < thin_snow_threshold:
+        damping_factor = thin_snow_damping * (1.0 - swe / thin_snow_threshold)
+        energy = energy * (1.0 - damping_factor)
 
     # Use minimum effective mass for thermal stability
     # This prevents wild temperature swings with thin snow
