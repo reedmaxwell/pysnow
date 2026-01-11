@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import os
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -18,8 +19,14 @@ from pysnow import PySnowModel, SnowConfig
 # Try to load SNOTEL data
 try:
     import hf_hydrodata as hf
-    hf.register_api_pin("reedmm@princeton.edu", "4321")
-    HAS_SNOTEL = True
+    email = os.environ.get('HF_EMAIL')
+    pin = os.environ.get('HF_PIN')
+    if email and pin:
+        hf.register_api_pin(email, pin)
+        HAS_SNOTEL = True
+    else:
+        HAS_SNOTEL = False
+        print("Warning: Set HF_EMAIL and HF_PIN environment variables for SNOTEL data")
 except:
     HAS_SNOTEL = False
     print("Warning: hf_hydrodata not available")

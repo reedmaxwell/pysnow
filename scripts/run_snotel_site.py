@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import os
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,14 +39,30 @@ try:
 except ImportError:
     HAS_HYDRODATA = False
     print("Warning: hf_hydrodata or subsettools not available")
+    print("Install with: pip install hf_hydrodata subsettools")
 
 from pysnow import PySnowModel, SnowConfig
 
 
 def register_hydrodata():
-    """Register HydroData API."""
+    """Register HydroData API using environment variables.
+
+    Set these environment variables before running:
+        export HF_EMAIL="your_email@example.com"
+        export HF_PIN="your_pin"
+
+    Or register at: https://hydrogen.princeton.edu/pin
+    """
     if HAS_HYDRODATA:
-        hf.register_api_pin("reedmm@princeton.edu", "4321")
+        email = os.environ.get('HF_EMAIL')
+        pin = os.environ.get('HF_PIN')
+
+        if email and pin:
+            hf.register_api_pin(email, pin)
+        else:
+            print("Warning: HF_EMAIL and HF_PIN environment variables not set.")
+            print("Register at https://hydrogen.princeton.edu/pin")
+            print("Then: export HF_EMAIL='your_email' && export HF_PIN='your_pin'")
 
 
 def list_snotel_sites(state):
