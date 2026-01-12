@@ -262,6 +262,430 @@ Where:
 
 ---
 
+## Code Operation and Execution Flow
+
+This section describes how PySnow executes a single timestep, including the order of operations and which modules are called.
+
+### Flowchart
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PySnowModel.step()                                │
+│                         (Main timestep driver)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. FORCING PREPROCESSING                                                    │
+│    • Unpack forcing dict (t_air, precip, sw_down, lw_down, wind, pressure, │
+│      q_air)                                                                 │
+│    • Convert precip from mm/hr to mm/timestep                              │
+│    • Calculate RH from specific humidity                                    │
+│      └── rain_snow.calc_rh_from_specific_humidity()                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. RAIN-SNOW PARTITIONING                        [if precip > 0]           │
+│    • Determine snow fraction                                                │
+│      └── rain_snow.partition_rain_snow()                                   │
+│    • Calculate snowfall = precip × snow_frac                               │
+│    • Calculate rainfall = precip × (1 - snow_frac)                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. ADD NEW SNOW                                  [if snowfall > 0]         │
+│    • Calculate fresh snow density                                           │
+│      └── compaction.calc_new_snow_density()                                │
+│    • Add snow to existing pack (weighted density)                          │
+│      └── compaction.add_fresh_snow()                                       │
+│    • Update snow age (reset weighted by new fraction)                      │
+│    • Update grain radius for SNICAR                                        │
+│    • Add rainfall to liquid water content                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. SNOW PHYSICS                                  [if SWE > 0]              │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4a. Age & Compact                                                  │  │
+│    │     • Increment snow age by dt                                     │  │
+│    │     • Update density via compaction                                │  │
+│    │       └── compaction.update_density()                              │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4b. Albedo                                                         │  │
+│    │     • Calculate new albedo (age/temp/grain dependent)              │  │
+│    │       └── albedo.calc_albedo()                                     │  │
+│    │     • Apply thin snow correction                                   │  │
+│    │       └── albedo.thin_snow_correction()                            │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4c. Energy Balance                                                 │  │
+│    │     • Net radiation                                                │  │
+│    │       └── radiation.calc_net_radiation()                           │  │
+│    │     • Turbulent fluxes (H, LE)                                     │  │
+│    │       └── turbulent.calc_turbulent_fluxes()                        │  │
+│    │     • Ground heat flux                                             │  │
+│    │       └── turbulent.calc_ground_heat_flux()                        │  │
+│    │     • Thermal conductivity (for ground flux)                       │  │
+│    │       └── thermal.calc_thermal_conductivity()                      │  │
+│    │     • Sum: Q_net = Rn + H + LE + G                                 │  │
+│    │     • Convert to energy: E = Q_net × dt                            │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4d. Phase Change                                                   │  │
+│    │     • Apply energy to snowpack (warm/cool/melt/refreeze)           │  │
+│    │       └── thermal.apply_energy_to_snowpack()                       │  │
+│    │     • Update SWE, temperature, liquid water                        │  │
+│    │     • Record melt and refreeze amounts                             │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4e. Sublimation                             [if E_mass < 0]        │  │
+│    │     • Remove mass from snowpack                                    │  │
+│    │     • Proportionally reduce ice and liquid                         │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+│    ┌────────────────────────────────────────────────────────────────────┐  │
+│    │ 4f. Liquid Water Drainage                                          │  │
+│    │     • Drain excess liquid water                                    │  │
+│    │       └── thermal.update_liquid_water()                            │  │
+│    │     • Reduce SWE by runoff amount                                  │  │
+│    └────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5. FINALIZE                                                                 │
+│    • Ensure temperature is physical (173K < T < 273.15K)                   │
+│    • Store fluxes for output                                               │
+│    • Return updated SnowState                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Step-by-Step Execution
+
+#### Step 1: Forcing Preprocessing
+
+The model unpacks atmospheric forcing data and performs unit conversions.
+
+```python
+# Unpack forcing
+t_air = forcing['t_air']
+precip = forcing['precip'] * dt / 3600.0  # mm/hr → mm/timestep
+sw_down = forcing['sw_down']
+lw_down = forcing['lw_down']
+wind = max(0.1, forcing['wind'])  # Minimum wind speed
+pressure = forcing['pressure']
+q_air = forcing['q_air']
+
+# Calculate relative humidity from specific humidity
+rh = rain_snow.calc_rh_from_specific_humidity(q_air, t_air, pressure)
+```
+
+#### Step 2: Rain-Snow Partitioning
+
+Precipitation is partitioned into snow and rain based on the configured method.
+
+```python
+if precip > 0:
+    snow_frac = rain_snow.partition_rain_snow(
+        precip, t_air, rh=rh, pressure=pressure,
+        method=cfg.rain_snow_method, **cfg.rain_snow_params
+    )
+    fluxes.snowfall = precip * snow_frac
+    fluxes.rainfall = precip * (1 - snow_frac)
+```
+
+**Module:** `pysnow/rain_snow.py`
+
+**Function calls:**
+- `partition_rain_snow()` → dispatches to method-specific function
+- Internal: `_threshold()`, `_linear_ramp()`, `_jennings()`, `_dai()`, `_wetbulb()`, `_wetbulb_linear()`, or `_wetbulb_sigmoid()`
+
+#### Step 3: Add New Snow
+
+Fresh snowfall is added to the existing snowpack with proper density weighting.
+
+```python
+if fluxes.snowfall > 0:
+    # Calculate fresh snow density (temperature-dependent)
+    rho_new = compaction.calc_new_snow_density(t_air)
+
+    # Add to pack with weighted density
+    state.density, state.swe, state.depth = compaction.add_fresh_snow(
+        state.density, state.swe, state.depth,
+        fluxes.snowfall, rho_new
+    )
+
+    # Reset snow age (weighted by new snow fraction)
+    if state.swe > 0:
+        frac_new = fluxes.snowfall / state.swe
+        state.age = state.age * (1 - frac_new)
+
+    # Reset grain radius for SNICAR (weighted)
+    if state.swe > 0:
+        frac_new = fluxes.snowfall / state.swe
+        state.grain_radius = frac_new * 50.0 + (1 - frac_new) * state.grain_radius
+
+# Add rainfall to liquid water
+if fluxes.rainfall > 0 and state.swe > 0:
+    state.liquid_water += fluxes.rainfall
+```
+
+**Module:** `pysnow/compaction.py`
+
+**Function calls:**
+- `calc_new_snow_density()` - Anderson (1976) temperature-dependent formula
+- `add_fresh_snow()` - Weighted harmonic mean density calculation
+
+#### Step 4: Snow Physics (if snow exists)
+
+This is the core physics block, only executed when SWE > 0.
+
+##### 4a. Age and Compaction
+
+```python
+# Age the snow
+state.age += dt
+
+# Update density via compaction
+state.density, state.depth = compaction.update_density(
+    state.density, state.swe, state.depth, state.t_snow, dt,
+    method=cfg.compaction_method
+)
+```
+
+**Module:** `pysnow/compaction.py`
+
+**Function calls:**
+- `update_density()` → dispatches to `_essery_compaction()`, `_anderson_compaction()`, or `_simple_compaction()`
+
+##### 4b. Albedo Calculation
+
+```python
+# Calculate albedo
+albedo_result = albedo_module.calc_albedo(
+    method=cfg.albedo_method,
+    age=state.age,
+    t_snow=state.t_snow,
+    snowfall=fluxes.snowfall,
+    swe=state.swe,
+    dt=dt,
+    albedo_prev=state.albedo,
+    grain_radius=state.grain_radius,
+    **cfg.albedo_params
+)
+state.albedo = albedo_result[0]
+if albedo_result[1] is not None:
+    state.grain_radius = albedo_result[1]
+
+# Apply thin snow correction (blend with ground)
+state.albedo = albedo_module.thin_snow_correction(
+    state.albedo, state.depth
+)
+```
+
+**Module:** `pysnow/albedo.py`
+
+**Function calls:**
+- `calc_albedo()` → dispatches to `_constant()`, `_clm_decay()`, `_vic()`, `_essery()`, `_tarboton()`, or `_snicar_lite()`
+- `thin_snow_correction()` - Blends snow/ground albedo for shallow snow
+
+##### 4c. Energy Balance
+
+```python
+# Net radiation
+rad = radiation.calc_net_radiation(
+    sw_down, lw_down, state.albedo, state.t_snow
+)
+fluxes.Rn = rad['Rn']
+
+# Turbulent fluxes (sensible and latent heat)
+turb = turbulent.calc_turbulent_fluxes(
+    t_air, state.t_snow, wind, rh, pressure,
+    z_wind=cfg.z_wind, z_temp=cfg.z_temp, z_0=cfg.z_0,
+    stability_correction=cfg.stability_correction,
+    windless_coeff=cfg.windless_coeff
+)
+fluxes.H = turb['H']
+fluxes.LE = turb['LE']
+
+# Ground heat flux
+thk_snow = thermal.calc_thermal_conductivity(
+    state.density, method=cfg.conductivity_method
+)
+fluxes.G = turbulent.calc_ground_heat_flux(
+    state.t_snow, cfg.t_soil, state.depth, thk_snow,
+    method=cfg.ground_flux_method, G_const=cfg.ground_flux_const
+)
+
+# Total energy for timestep
+Q_net = fluxes.Rn + fluxes.H + fluxes.LE + fluxes.G
+energy = Q_net * dt  # Convert W/m² to J/m²
+```
+
+**Modules:** `pysnow/radiation.py`, `pysnow/turbulent.py`, `pysnow/thermal.py`
+
+**Function calls:**
+- `radiation.calc_net_radiation()` - SW absorbed + LW balance
+- `turbulent.calc_turbulent_fluxes()` - Bulk aerodynamic with stability correction
+- `thermal.calc_thermal_conductivity()` - Jordan, Sturm, or Calonne method
+- `turbulent.calc_ground_heat_flux()` - Constant or gradient method
+
+##### 4d. Phase Change
+
+```python
+phase_result = thermal.apply_energy_to_snowpack(
+    energy, state.swe, state.t_snow, state.liquid_water,
+    method=cfg.phase_change_method,
+    cold_content_tax=cfg.cold_content_tax,
+    thin_snow_damping=cfg.thin_snow_damping,
+    thin_snow_threshold=cfg.thin_snow_threshold
+)
+
+state.swe = phase_result['swe']
+state.t_snow = phase_result['t_snow']
+state.liquid_water = phase_result['liquid_water']
+fluxes.melt = phase_result['melt']
+fluxes.refreeze = phase_result['refreeze']
+
+# Update depth from new ice content
+if state.swe > 0 and state.density > 0:
+    ice = state.swe - state.liquid_water
+    state.depth = ice / state.density
+```
+
+**Module:** `pysnow/thermal.py`
+
+**Function calls:**
+- `apply_energy_to_snowpack()` → dispatches to `_energy_hierarchy()` or `_energy_clm_style()`
+- Internal: `calc_cold_content()`, `temp_from_cold_content()`
+
+##### 4e. Sublimation
+
+```python
+if turb['E_mass'] < 0:  # Mass loss (sublimation)
+    sublim = abs(turb['E_mass']) * dt  # kg/m² = mm
+    sublim = min(sublim, state.swe)
+    state.swe -= sublim
+    fluxes.sublimation = -sublim
+
+    # Remove proportionally from ice and liquid
+    if state.swe > 0:
+        state.liquid_water = state.liquid_water * (state.swe / (state.swe + sublim))
+    else:
+        state.liquid_water = 0
+```
+
+##### 4f. Liquid Water Drainage
+
+```python
+state.liquid_water, fluxes.runoff = thermal.update_liquid_water(
+    state.liquid_water, state.depth, dt,
+    min_frac=cfg.min_water_frac, max_frac=cfg.max_water_frac,
+    drain_rate=cfg.drain_rate
+)
+
+# Reduce SWE by runoff amount
+state.swe -= fluxes.runoff
+state.swe = max(0, state.swe)
+```
+
+**Module:** `pysnow/thermal.py`
+
+**Function calls:**
+- `update_liquid_water()` - Drains excess above holding capacity
+
+#### Step 5: Finalize
+
+```python
+# Safety: ensure temperature is physical
+state.t_snow = max(173.15, min(TFRZ, state.t_snow))
+
+# Store fluxes
+self.fluxes = fluxes
+
+return state
+```
+
+### Module Dependency Graph
+
+```
+model.py (PySnowModel)
+    │
+    ├── rain_snow.py
+    │       └── calc_rh_from_specific_humidity()
+    │       └── partition_rain_snow()
+    │
+    ├── compaction.py
+    │       └── calc_new_snow_density()
+    │       └── add_fresh_snow()
+    │       └── update_density()
+    │
+    ├── albedo.py
+    │       └── calc_albedo()
+    │       └── thin_snow_correction()
+    │
+    ├── radiation.py
+    │       └── calc_net_radiation()
+    │
+    ├── turbulent.py
+    │       └── calc_turbulent_fluxes()
+    │       └── calc_ground_heat_flux()
+    │
+    └── thermal.py
+            └── calc_thermal_conductivity()
+            └── apply_energy_to_snowpack()
+            └── update_liquid_water()
+```
+
+### Batch Execution: `model.run()`
+
+For running multiple timesteps, `run()` wraps `step()` in a loop:
+
+```python
+def run(self, forcing_data: np.ndarray, dt: float = 3600.0) -> Dict[str, np.ndarray]:
+    """Run model for multiple timesteps."""
+    n_steps = len(forcing_data)
+
+    # Initialize output arrays
+    outputs = {
+        'swe': np.zeros(n_steps),
+        'depth': np.zeros(n_steps),
+        # ... other variables
+    }
+
+    self.reset()  # Reset state to initial conditions
+
+    for i in range(n_steps):
+        # Unpack forcing array to dict
+        forcing = {
+            'sw_down': forcing_data[i, 0],
+            'lw_down': forcing_data[i, 1],
+            'precip': forcing_data[i, 2],
+            't_air': forcing_data[i, 3],
+            'wind': np.sqrt(forcing_data[i, 4]**2 + forcing_data[i, 5]**2),
+            'pressure': forcing_data[i, 6],
+            'q_air': forcing_data[i, 7],
+        }
+
+        # Execute single timestep
+        state = self.step(forcing, dt)
+
+        # Store outputs
+        outputs['swe'][i] = state.swe
+        outputs['depth'][i] = state.depth
+        # ... store other variables
+
+    return outputs
+```
+
+**Forcing Array Format:** `(n_steps, 8)` with columns:
+`[sw_down, lw_down, precip, t_air, wind_u, wind_v, pressure, q_air]`
+
+---
+
 ## Configuration
 
 ### SnowConfig Parameters
